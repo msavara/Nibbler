@@ -1,0 +1,87 @@
+name: Build macOS arm64 app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 */12 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Resolve upstream release tag
+        id: upstream
+        run: |
+          set -euo pipefail
+          TAG="$(curl -fsSL -o /dev/null -w "%{url_effective}" "https://github.com/rooklift/nibbler/releases/latest" | awk -F/ '{print $NF}')"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if this tag already has a release here (schedule only)
+        id: existing
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.upstream.outputs.tag }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: github.event_name != 'schedule' || steps.existing.outputs.exists != 'true'
+        run: ./scripts/build.sh
+        env:
+          NIBBLER_TAG: ${{ steps.upstream.outputs.tag }}
+          ELECTRON_VERSION: "40.1.0"
+          PACKAGER_VERSION: "19.0.2"
+          BUNDLE_ID: "com.msavara.nibbler"
+
+      - name: Upload artifact
+        if: github.event_name != 'schedule' || steps.existing.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nibbler-macOS-arm64
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        if: github.event_name != 'schedule' || steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TAG="$(cat dist/tag.txt)"
+          ZIP="$(ls -1 dist/*.zip | head -n 1)"
+          ELECTRON_VERSION="$(cat dist/electron_version.txt)"
+
+          echo "Tag: ${TAG}"
+          echo "Asset: ${ZIP}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            if [[ "${{ github.event_name }}" == "schedule" ]]; then
+              echo "Release ${TAG} already exists (scheduled run): skipping publish."
+              exit 0
+            fi
+            gh release upload "${TAG}" "${ZIP}" --clobber
+          else
+            gh release create "${TAG}" "${ZIP}" \
+              --title "Nibbler ${TAG} (macOS arm64)" \
+              --notes "Built from rooklift/nibbler ${TAG} using Electron ${ELECTRON_VERSION}. Unsigned (ad-hoc signed)."
+          fi
